@@ -1,0 +1,35 @@
+{
+  "updatedAt": "2026-11-22T20:56:31.227823+00:00",
+  "topics": {
+    "it": {
+      "title": "IT и ИИ",
+      "file": "it.json",
+      "count": 6
+    },
+    "economy": {
+      "title": "Экономика и бизнес",
+      "file": "economy.json",
+      "count": 6
+    },
+    "finance_crypto": {
+      "title": "Финансы, акции и крипта",
+      "file": "finance_crypto.json",
+      "count": 6
+    },
+    "law": {
+      "title": "Юриспруденция и право",
+      "file": "law.json",
+      "count": 4
+    },
+    "politics": {
+      "title": "Политика и мир",
+      "file": "politics.json",
+      "count": 5
+    },
+    "history": {
+      "title": "История",
+      "file": "history.json",
+      "count": 1
+    }
+  }
+}

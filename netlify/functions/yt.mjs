@@ -7,8 +7,10 @@ const CORS_HEADERS = {
 
 const YT_HEADERS = {
   "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
   "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+  "Cookie":
+    "CONSENT=YES+cb.20210328-17-p0.en+FX+417; SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg",
 };
 
 function json(obj, status = 200) {
@@ -27,30 +29,32 @@ function decodeHtmlEntities(str) {
     .trim();
 }
 
-function extractJsonObject(html, marker) {
-  const idx = html.indexOf(marker);
-  if (idx === -1) return null;
-  const start = html.indexOf("{", idx + marker.length);
-  if (start === -1) return null;
-  let depth = 0;
-  let inStr = false;
-  let escape = false;
-  for (let i = start; i < html.length; i++) {
-    const ch = html[i];
-    if (inStr) {
-      if (escape) escape = false;
-      else if (ch === "\\") escape = true;
-      else if (ch === '"') inStr = false;
-    } else {
-      if (ch === '"') inStr = true;
-      else if (ch === "{") depth++;
-      else if (ch === "}") {
-        depth--;
-        if (depth === 0) {
-          try {
-            return JSON.parse(html.slice(start, i + 1));
-          } catch {
-            return null;
+function extractJsonObject(html, markers) {
+  for (const marker of markers) {
+    const idx = html.indexOf(marker);
+    if (idx === -1) continue;
+    const start = html.indexOf("{", idx + marker.length);
+    if (start === -1) continue;
+    let depth = 0;
+    let inStr = false;
+    let escape = false;
+    for (let i = start; i < html.length; i++) {
+      const ch = html[i];
+      if (inStr) {
+        if (escape) escape = false;
+        else if (ch === "\\") escape = true;
+        else if (ch === '"') inStr = false;
+      } else {
+        if (ch === '"') inStr = true;
+        else if (ch === "{") depth++;
+        else if (ch === "}") {
+          depth--;
+          if (depth === 0) {
+            try {
+              return JSON.parse(html.slice(start, i + 1));
+            } catch {
+              break;
+            }
           }
         }
       }
@@ -59,25 +63,13 @@ function extractJsonObject(html, marker) {
   return null;
 }
 
-async function handleSearch(query, sp) {
-  let url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-  if (sp) url += `&sp=${encodeURIComponent(sp)}`;
+function collectVideos(node, out, seen) {
+  if (!node || typeof node !== "object" || out.length >= 10) return;
 
-  const resp = await fetch(url, { headers: YT_HEADERS });
-  const html = await resp.text();
-  const data = extractJsonObject(html, "var ytInitialData =");
-  if (!data) return [];
-
-  const sections =
-    data?.contents?.twoColumnSearchResultsRenderer?.primaryContents
-      ?.sectionListRenderer?.contents || [];
-
-  const videos = [];
-  for (const sec of sections) {
-    const items = sec?.itemSectionRenderer?.contents || [];
-    for (const item of items) {
-      const v = item?.videoRenderer;
-      if (!v || !v.videoId) continue;
+  if (node.videoRenderer && node.videoRenderer.videoId) {
+    const v = node.videoRenderer;
+    if (!seen.has(v.videoId)) {
+      seen.add(v.videoId);
       const title =
         v.title?.runs?.map((r) => r.text).join("") ||
         v.title?.simpleText ||
@@ -89,7 +81,7 @@ async function handleSearch(query, sp) {
       const duration = v.lengthText?.simpleText || "";
       const views = v.viewCountText?.simpleText || "";
       const published = v.publishedTimeText?.simpleText || "";
-      videos.push({
+      out.push({
         videoId: v.videoId,
         title,
         channelName,
@@ -99,18 +91,122 @@ async function handleSearch(query, sp) {
         thumbnailUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
         videoUrl: `https://www.youtube.com/watch?v=${v.videoId}`,
       });
-      if (videos.length >= 10) return videos;
+    }
+    return;
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      collectVideos(item, out, seen);
+      if (out.length >= 10) return;
+    }
+  } else {
+    for (const key of Object.keys(node)) {
+      collectVideos(node[key], out, seen);
+      if (out.length >= 10) return;
     }
   }
+}
+
+async function searchViaInnertube(query, sp) {
+  const payload = {
+    context: {
+      client: {
+        clientName: "WEB",
+        clientVersion: "2.20250501.00.00",
+        hl: "ru",
+        gl: "RU",
+      },
+    },
+    query,
+  };
+  if (sp) payload.params = sp;
+
+  const resp = await fetch("https://www.youtube.com/youtubei/v1/search?prettyPrint=false", {
+    method: "POST",
+    headers: {
+      ...YT_HEADERS,
+      "Content-Type": "application/json",
+      "Origin": "https://www.youtube.com",
+      "Referer": "https://www.youtube.com/",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) return [];
+  const data = await resp.json();
+  const videos = [];
+  collectVideos(data, videos, new Set());
   return videos;
 }
 
-async function handleTranscript(videoId) {
-  const resp = await fetch(`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`, {
-    headers: YT_HEADERS,
-  });
+async function searchViaHtml(query, sp) {
+  let url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&hl=ru`;
+  if (sp) url += `&sp=${encodeURIComponent(sp)}`;
+
+  const resp = await fetch(url, { headers: YT_HEADERS });
   const html = await resp.text();
-  const player = extractJsonObject(html, "var ytInitialPlayerResponse =");
+  const data = extractJsonObject(html, [
+    "var ytInitialData =",
+    'window["ytInitialData"] =',
+    "ytInitialData =",
+  ]);
+  if (!data) return [];
+  const videos = [];
+  collectVideos(data, videos, new Set());
+  return videos;
+}
+
+async function handleSearch(query, sp) {
+  try {
+    const videos = await searchViaInnertube(query, sp);
+    if (videos.length > 0) return videos;
+  } catch {
+    // fallback below
+  }
+  return await searchViaHtml(query, sp);
+}
+
+async function fetchPlayerData(videoId) {
+  try {
+    const resp = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
+      method: "POST",
+      headers: {
+        ...YT_HEADERS,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: "WEB",
+            clientVersion: "2.20250501.00.00",
+            hl: "ru",
+            gl: "RU",
+          },
+        },
+        videoId,
+      }),
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data?.videoDetails?.title) return data;
+    }
+  } catch {
+    // fallback below
+  }
+
+  const htmlResp = await fetch(
+    `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=ru`,
+    { headers: YT_HEADERS }
+  );
+  const html = await htmlResp.text();
+  return extractJsonObject(html, [
+    "var ytInitialPlayerResponse =",
+    'window["ytInitialPlayerResponse"] =',
+  ]);
+}
+
+async function handleTranscript(videoId) {
+  const player = await fetchPlayerData(videoId);
   if (!player) {
     return { ok: false, error: "Could not parse YouTube video page" };
   }
@@ -120,13 +216,13 @@ async function handleTranscript(videoId) {
   const description = (player?.videoDetails?.shortDescription || "").slice(0, 3000);
   const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
 
-  let chosen =
+  const chosen =
     tracks.find((t) => (t.languageCode || "").startsWith("ru")) ||
     tracks.find((t) => (t.languageCode || "").startsWith("en")) ||
     tracks[0];
 
   let transcriptText = "";
-  let transcriptLanguage = chosen?.languageCode || "";
+  const transcriptLanguage = chosen?.languageCode || "";
 
   if (chosen && chosen.baseUrl) {
     try {

@@ -29,40 +29,6 @@ function decodeHtmlEntities(str) {
     .trim();
 }
 
-function extractJsonObject(html, markers) {
-  for (const marker of markers) {
-    const idx = html.indexOf(marker);
-    if (idx === -1) continue;
-    const start = html.indexOf("{", idx + marker.length);
-    if (start === -1) continue;
-    let depth = 0;
-    let inStr = false;
-    let escape = false;
-    for (let i = start; i < html.length; i++) {
-      const ch = html[i];
-      if (inStr) {
-        if (escape) escape = false;
-        else if (ch === "\\") escape = true;
-        else if (ch === '"') inStr = false;
-      } else {
-        if (ch === '"') inStr = true;
-        else if (ch === "{") depth++;
-        else if (ch === "}") {
-          depth--;
-          if (depth === 0) {
-            try {
-              return JSON.parse(html.slice(start, i + 1));
-            } catch {
-              break;
-            }
-          }
-        }
-      }
-    }
-  }
-  return null;
-}
-
 function collectVideos(node, out, seen) {
   if (!node || typeof node !== "object" || out.length >= 10) return;
 
@@ -108,7 +74,21 @@ function collectVideos(node, out, seen) {
   }
 }
 
-async function searchViaInnertube(query, sp) {
+function findFirstString(node, predicate) {
+  if (!node || typeof node !== "object") return "";
+  for (const key of Object.keys(node)) {
+    const val = node[key];
+    const hit = predicate(key, val);
+    if (hit) return hit;
+    if (val && typeof val === "object") {
+      const nested = findFirstString(val, predicate);
+      if (nested) return nested;
+    }
+  }
+  return "";
+}
+
+async function handleSearch(query, sp) {
   const payload = {
     context: {
       client: {
@@ -139,92 +119,104 @@ async function searchViaInnertube(query, sp) {
   return videos;
 }
 
-async function handleSearch(query, sp) {
+async function fetchNextMetadata(videoId) {
   try {
-    const videos = await searchViaInnertube(query, sp);
-    if (videos.length > 0) return videos;
+    const resp = await fetch("https://www.youtube.com/youtubei/v1/next?prettyPrint=false", {
+      method: "POST",
+      headers: {
+        ...YT_HEADERS,
+        "Content-Type": "application/json",
+        "Origin": "https://www.youtube.com",
+        "Referer": `https://www.youtube.com/watch?v=${videoId}`,
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: "WEB",
+            clientVersion: "2.20250501.00.00",
+            hl: "ru",
+            gl: "RU",
+          },
+        },
+        videoId,
+      }),
+    });
+    if (!resp.ok) return { description: "", transcriptParams: "" };
+    const data = await resp.json();
+
+    const description = findFirstString(data, (k, v) => {
+      if (k === "attributedDescription" && v && typeof v.content === "string" && v.content.length > 20) {
+        return v.content;
+      }
+      if (k === "description" && v && typeof v.simpleText === "string" && v.simpleText.length > 20) {
+        return v.simpleText;
+      }
+      if (k === "attributedDescriptionBodyText" && v && typeof v.content === "string" && v.content.length > 20) {
+        return v.content;
+      }
+      return "";
+    });
+
+    const transcriptParams = findFirstString(data, (k, v) => {
+      if (k === "getTranscriptEndpoint" && v && typeof v.params === "string") {
+        return v.params;
+      }
+      return "";
+    });
+
+    return { description: description.slice(0, 4000), transcriptParams };
   } catch {
-    // fallback below
+    return { description: "", transcriptParams: "" };
   }
-  let url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&hl=ru`;
-  if (sp) url += `&sp=${encodeURIComponent(sp)}`;
-  const resp = await fetch(url, { headers: YT_HEADERS });
-  const html = await resp.text();
-  const data = extractJsonObject(html, [
-    "var ytInitialData =",
-    'window["ytInitialData"] =',
-  ]);
-  if (!data) return [];
-  const videos = [];
-  collectVideos(data, videos, new Set());
-  return videos;
 }
 
-async function callPlayerClient(videoId, clientObj, userAgent) {
-  const resp = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": userAgent,
-      "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
-    },
-    body: JSON.stringify({
-      context: { client: clientObj },
-      videoId,
-    }),
-  });
-  if (!resp.ok) return null;
-  return await resp.json();
-}
-
-async function fetchPlayerData(videoId) {
-  const clients = [
-    {
-      client: {
-        clientName: "ANDROID",
-        clientVersion: "20.10.38",
-        androidSdkVersion: 30,
-        hl: "ru",
-        gl: "RU",
-      },
-      ua: "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
-    },
-    {
-      client: {
-        clientName: "IOS",
-        clientVersion: "20.10.4",
-        deviceMake: "Apple",
-        deviceModel: "iPhone16,2",
-        hl: "ru",
-        gl: "RU",
-      },
-      ua: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3 like Mac OS X)",
-    },
-    {
-      client: {
-        clientName: "WEB",
-        clientVersion: "2.20250501.00.00",
-        hl: "ru",
-        gl: "RU",
-      },
-      ua: YT_HEADERS["User-Agent"],
-    },
-  ];
-
-  let best = null;
-  for (const cfg of clients) {
-    try {
-      const data = await callPlayerClient(videoId, cfg.client, cfg.ua);
-      const hasDetails = Boolean(data?.videoDetails?.title);
-      const hasCaptions =
-        (data?.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length || 0) > 0;
-      if (hasDetails && hasCaptions) return data;
-      if (hasDetails && !best) best = data;
-    } catch {
-      // try next client
-    }
+async function fetchTranscriptViaNextEndpoint(params) {
+  if (!params) return "";
+  try {
+    const resp = await fetch(
+      "https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false",
+      {
+        method: "POST",
+        headers: {
+          ...YT_HEADERS,
+          "Content-Type": "application/json",
+          "Origin": "https://www.youtube.com",
+          "Referer": "https://www.youtube.com/",
+        },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: "WEB",
+              clientVersion: "2.20250501.00.00",
+              hl: "ru",
+              gl: "RU",
+            },
+          },
+          params,
+        }),
+      }
+    );
+    if (!resp.ok) return "";
+    const data = await resp.json();
+    const lines = [];
+    const walk = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (node.transcriptSegmentRenderer?.snippet?.runs) {
+        const text = node.transcriptSegmentRenderer.snippet.runs
+          .map((r) => r.text || "")
+          .join("")
+          .trim();
+        if (text) lines.push(text);
+        return;
+      }
+      if (Array.isArray(node)) node.forEach(walk);
+      else Object.values(node).forEach(walk);
+    };
+    walk(data);
+    return decodeHtmlEntities(lines.join(" ")).slice(0, 15000);
+  } catch {
+    return "";
   }
-  return best;
 }
 
 async function fetchOembed(videoId) {
@@ -239,65 +231,16 @@ async function fetchOembed(videoId) {
   return null;
 }
 
-async function downloadCaptionText(baseUrl) {
-  // Пробуем JSON3-формат (чище и стабильнее XML)
-  try {
-    const sep = baseUrl.includes("?") ? "&" : "?";
-    const resp = await fetch(`${baseUrl}${sep}fmt=json3`, { headers: YT_HEADERS });
-    if (resp.ok) {
-      const data = await resp.json();
-      const events = data?.events || [];
-      const parts = [];
-      for (const ev of events) {
-        if (!ev.segs) continue;
-        const line = ev.segs.map((s) => s.utf8 || "").join("").replace(/\s+/g, " ").trim();
-        if (line) parts.push(line);
-      }
-      const joined = parts.join(" ").trim();
-      if (joined) return joined.slice(0, 15000);
-    }
-  } catch {
-    // fallback to XML
-  }
-
-  try {
-    const resp = await fetch(baseUrl, { headers: YT_HEADERS });
-    const xml = await resp.text();
-    const parts = [];
-    const regex = /<text[^>]*>([\s\S]*?)<\/text>/g;
-    let match;
-    while ((match = regex.exec(xml)) !== null) {
-      const cleaned = decodeHtmlEntities(match[1]);
-      if (cleaned) parts.push(cleaned);
-    }
-    return parts.join(" ").slice(0, 15000);
-  } catch {
-    return "";
-  }
-}
-
 async function handleTranscript(videoId) {
-  const [player, oembed] = await Promise.all([
-    fetchPlayerData(videoId),
+  const [nextMeta, oembed] = await Promise.all([
+    fetchNextMetadata(videoId),
     fetchOembed(videoId),
   ]);
 
-  const title = player?.videoDetails?.title || oembed?.title || "";
-  const channelName = player?.videoDetails?.author || oembed?.author_name || "";
-  const description = (player?.videoDetails?.shortDescription || "").slice(0, 3500);
-  const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-
-  const chosen =
-    tracks.find((t) => (t.languageCode || "").startsWith("ru")) ||
-    tracks.find((t) => (t.languageCode || "").startsWith("en")) ||
-    tracks[0];
-
-  let transcriptText = "";
-  const transcriptLanguage = chosen?.languageCode || "";
-
-  if (chosen && chosen.baseUrl) {
-    transcriptText = await downloadCaptionText(chosen.baseUrl);
-  }
+  const title = oembed?.title || "";
+  const channelName = oembed?.author_name || "";
+  const description = nextMeta.description || "";
+  const transcriptText = await fetchTranscriptViaNextEndpoint(nextMeta.transcriptParams);
 
   return {
     ok: Boolean(title || description || transcriptText),
@@ -305,7 +248,7 @@ async function handleTranscript(videoId) {
     title,
     channelName,
     description,
-    transcriptLanguage,
+    transcriptLanguage: transcriptText ? "auto" : "",
     transcriptText,
   };
 }

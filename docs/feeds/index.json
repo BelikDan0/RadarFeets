@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-11-28T01:02:15.675218+00:00",
+  "updatedAt": "2026-11-28T14:59:23.652505+00:00",
   "topics": {
     "it": {
       "title": "IT и ИИ",
@@ -29,7 +29,7 @@
     "history": {
       "title": "История",
       "file": "history.json",
-      "count": 21
+      "count": 22
     }
   }
 }
